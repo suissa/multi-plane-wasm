@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+MOD_ROOT = ROOT / "planes-modules"
+DIST = ROOT / "dist"
+
+
+def sh(cmd: list[str], cwd: Path | None = None) -> None:
+    proc = subprocess.run(cmd, cwd=cwd, check=False, text=True)
+    if proc.returncode != 0:
+        raise SystemExit(proc.returncode)
+
+
+def discover() -> list[Path]:
+    return sorted(list(MOD_ROOT.glob("*/*.wat")) + list(MOD_ROOT.glob("*/*.wasm")))
+
+
+def cmd_fetch(url_base: str) -> None:
+    MOD_ROOT.mkdir(parents=True, exist_ok=True)
+    manifest = MOD_ROOT / "modules.json"
+    sh(["curl", "-fsSL", f"{url_base.rstrip('/')}/modules.json", "-o", str(manifest)])
+    data = json.loads(manifest.read_text())
+    for module in data.get("modules", []):
+        name = module["name"]
+        source = module["source"]
+        target_dir = MOD_ROOT / name
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"{name}.wat"
+        sh(["curl", "-fsSL", f"{url_base.rstrip('/')}/{source}", "-o", str(target)])
+        print(f"baixado: {name} -> {target}")
+
+
+def validate_module(path: Path) -> None:
+    if path.suffix == ".wat":
+        txt = path.read_text()
+        if '(import "' in txt and '"env"' not in txt:
+            raise SystemExit(f"módulo {path} possui import não nativo")
+        if "(memory" not in txt:
+            raise SystemExit(f"módulo {path} sem memória declarada")
+
+
+def cmd_validate() -> None:
+    mods = discover()
+    if not mods:
+        raise SystemExit("nenhum módulo encontrado")
+    for m in mods:
+        validate_module(m)
+    print(f"ok: {len(mods)} módulo(s) válidos")
+
+
+def cmd_compile() -> None:
+    cmd_validate()
+    DIST.mkdir(parents=True, exist_ok=True)
+    wasm_paths: list[Path] = []
+    for mod in discover():
+        if mod.suffix == ".wat":
+            out = mod.with_suffix(".wasm")
+            try:
+                sh(["wat2wasm", str(mod), "-o", str(out)])
+            except FileNotFoundError:
+                raise SystemExit("wat2wasm não encontrado; instale WABT para compilar módulos .wat")
+            wasm_paths.append(out)
+        else:
+            wasm_paths.append(mod)
+
+    module_names = " ".join([w.parent.name for w in wasm_paths])
+    main_wat = f"""(module
+  (memory (export \"memory\") 1 1)
+  (data (i32.const 0) \"planes:{module_names}\")
+  (func (export \"run\")
+    nop)
+)
+"""
+    wat_file = DIST / "main.wat"
+    wat_file.write_text(main_wat)
+    try:
+        sh(["wat2wasm", str(wat_file), "-o", str(DIST / "main.wasm")])
+    except FileNotFoundError:
+        raise SystemExit("wat2wasm não encontrado; instale WABT para gerar dist/main.wasm")
+    print("compilado: dist/main.wasm")
+
+
+def cmd_run(tick: float) -> None:
+    sh(["python3", str(ROOT / "runtime" / "supervisor.py"), "--tick", str(tick)])
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="plane")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_fetch = sub.add_parser("fetch")
+    p_fetch.add_argument("url_base")
+
+    sub.add_parser("validate")
+    sub.add_parser("compile")
+
+    p_run = sub.add_parser("run")
+    p_run.add_argument("--tick", type=float, default=1.0)
+
+    args = parser.parse_args()
+
+    if args.cmd == "fetch":
+        cmd_fetch(args.url_base)
+    elif args.cmd == "validate":
+        cmd_validate()
+    elif args.cmd == "compile":
+        cmd_compile()
+    elif args.cmd == "run":
+        cmd_run(args.tick)
+
+
+if __name__ == "__main__":
+    main()

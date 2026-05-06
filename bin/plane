@@ -3,12 +3,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MOD_ROOT = ROOT / "planes-modules"
 DIST = ROOT / "dist"
+
+APT_PACKAGES = {
+    "curl": "curl",
+    "node": "nodejs",
+    "python3": "python3",
+    "wat2wasm": "wabt",
+    "nats-server": "nats-server",
+}
+
+CHECKS = ["python3", "curl", "node", "wat2wasm", "wasmtime", "nats-server"]
+NODE_TESTS = [
+    "scripts/linear_token_system_core_test.mjs",
+    "scripts/sidecar_linear_dpop_test.mjs",
+    "scripts/nats_linear_event_contract_test.mjs",
+]
 
 
 def sh(cmd: list[str], cwd: Path | None = None) -> None:
@@ -17,8 +35,46 @@ def sh(cmd: list[str], cwd: Path | None = None) -> None:
         raise SystemExit(proc.returncode)
 
 
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
 def discover() -> list[Path]:
     return sorted(list(MOD_ROOT.glob("*/*.wat")) + list(MOD_ROOT.glob("*/*.wasm")))
+
+
+def discover_wasm() -> list[Path]:
+    return sorted(MOD_ROOT.glob("*/*.wasm"))
+
+
+def print_tool_report() -> dict[str, bool]:
+    report = {tool: command_exists(tool) for tool in CHECKS}
+    for tool, ok in report.items():
+        status = "ok" if ok else "missing"
+        print(f"{tool}: {status}")
+    return report
+
+
+def install_missing_tools(missing: list[str]) -> None:
+    apt_missing = [APT_PACKAGES[t] for t in missing if t in APT_PACKAGES]
+    if apt_missing and command_exists("apt-get"):
+        prefix: list[str] = []
+        if os.geteuid() != 0:
+            if command_exists("sudo"):
+                prefix = ["sudo"]
+            else:
+                print("aviso: apt-get disponível, mas sem root/sudo; instale manualmente: " + ", ".join(apt_missing))
+                return
+        sh(prefix + ["apt-get", "update"])
+        sh(prefix + ["apt-get", "install", "-y", *sorted(set(apt_missing))])
+
+    if "wasmtime" in missing:
+        if command_exists("curl"):
+            print("instalando wasmtime via script oficial em ~/.wasmtime")
+            sh(["bash", "-lc", "curl -fsSL https://wasmtime.dev/install.sh | bash"])
+            print("aviso: reabra o shell ou adicione ~/.wasmtime/bin ao PATH se wasmtime ainda não aparecer")
+        else:
+            print("aviso: curl ausente; não foi possível instalar wasmtime automaticamente")
 
 
 def cmd_fetch(url_base: str) -> None:
@@ -61,6 +117,9 @@ def cmd_compile() -> None:
     for mod in discover():
         if mod.suffix == ".wat":
             out = mod.with_suffix(".wasm")
+            if not command_exists("wat2wasm"):
+                raise SystemExit("wat2wasm não encontrado; execute ./bin/plane setup ou instale WABT")
+            sh(["wat2wasm", str(mod), "-o", str(out)])
             try:
                 sh(["wat2wasm", str(mod), "-o", str(out)])
             except FileNotFoundError:
@@ -79,6 +138,81 @@ def cmd_compile() -> None:
 """
     wat_file = DIST / "main.wat"
     wat_file.write_text(main_wat)
+    if not command_exists("wat2wasm"):
+        raise SystemExit("wat2wasm não encontrado; execute ./bin/plane setup ou instale WABT")
+    sh(["wat2wasm", str(wat_file), "-o", str(DIST / "main.wasm")])
+    print("compilado: dist/main.wasm")
+
+
+def run_contract_tests() -> None:
+    if not command_exists("node"):
+        print("aviso: node ausente; pulando testes Node")
+        return
+    for script in NODE_TESTS:
+        sh(["node", script], cwd=ROOT)
+
+
+def cmd_setup(check_only: bool, skip_install: bool, skip_compile: bool) -> None:
+    print("== verificando ferramentas ==")
+    report = print_tool_report()
+    missing = [tool for tool, ok in report.items() if not ok]
+    if missing and not check_only and not skip_install:
+        print("== instalando dependências ausentes quando possível ==")
+        install_missing_tools(missing)
+        report = print_tool_report()
+
+    MOD_ROOT.mkdir(parents=True, exist_ok=True)
+    DIST.mkdir(parents=True, exist_ok=True)
+
+    print("== validando módulos ==")
+    cmd_validate()
+
+    print("== executando testes de contrato ==")
+    run_contract_tests()
+
+    if not skip_compile:
+        if command_exists("wat2wasm"):
+            print("== compilando módulos WASM ==")
+            cmd_compile()
+        else:
+            print("aviso: wat2wasm ausente; compilação pulada. Instale WABT e rode ./bin/plane compile")
+
+    if check_only:
+        print("setup check-only concluído")
+    else:
+        print("setup concluído")
+
+
+def start_nats_if_available(port: int) -> subprocess.Popen[bytes] | None:
+    if not command_exists("nats-server"):
+        print("aviso: nats-server ausente; usando NATS externo se NATS_URL estiver configurado")
+        return None
+    proc = subprocess.Popen(
+        ["nats-server", "-p", str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.5)
+    print(f"nats-server iniciado em nats://127.0.0.1:{port} (pid={proc.pid})")
+    return proc
+
+
+def ensure_compiled_for_run(skip_compile: bool) -> None:
+    if skip_compile and discover_wasm():
+        return
+    if not discover_wasm():
+        print("nenhum .wasm encontrado; compilando módulos antes do run")
+        cmd_compile()
+
+
+def cmd_run(tick: float, skip_compile: bool, no_nats: bool, nats_port: int) -> None:
+    ensure_compiled_for_run(skip_compile)
+    nats_proc = None if no_nats else start_nats_if_available(nats_port)
+    try:
+        sh(["python3", str(ROOT / "runtime" / "supervisor.py"), "--tick", str(tick)])
+    finally:
+        if nats_proc is not None:
+            nats_proc.terminate()
     try:
         sh(["wat2wasm", str(wat_file), "-o", str(DIST / "main.wasm")])
     except FileNotFoundError:
@@ -94,12 +228,28 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="plane")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    p_setup = sub.add_parser("setup", help="instala/verifica dependências, valida, testa e compila")
+    p_setup.add_argument("--check-only", action="store_true", help="não instala; apenas verifica e executa validações possíveis")
+    p_setup.add_argument("--skip-install", action="store_true", help="não tenta instalar dependências ausentes")
+    p_setup.add_argument("--skip-compile", action="store_true", help="não compila WASM no setup")
+
     p_fetch = sub.add_parser("fetch")
     p_fetch.add_argument("url_base")
 
     sub.add_parser("validate")
     sub.add_parser("compile")
 
+    p_run = sub.add_parser("run", help="compila se necessário, inicia NATS quando disponível e executa o supervisor")
+    p_run.add_argument("--tick", type=float, default=1.0)
+    p_run.add_argument("--skip-compile", action="store_true")
+    p_run.add_argument("--no-nats", action="store_true")
+    p_run.add_argument("--nats-port", type=int, default=4222)
+
+    args = parser.parse_args()
+
+    if args.cmd == "setup":
+        cmd_setup(args.check_only, args.skip_install, args.skip_compile)
+    elif args.cmd == "fetch":
     p_run = sub.add_parser("run")
     p_run.add_argument("--tick", type=float, default=1.0)
 
@@ -112,6 +262,7 @@ def main() -> None:
     elif args.cmd == "compile":
         cmd_compile()
     elif args.cmd == "run":
+        cmd_run(args.tick, args.skip_compile, args.no_nats, args.nats_port)
         cmd_run(args.tick)
 
 

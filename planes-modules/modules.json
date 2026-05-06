@@ -1,0 +1,8 @@
+{
+  "modules": [
+    {
+      "name": "echo",
+      "source": "echo/echo.wat"
+    }
+  ]
+}

@@ -120,6 +120,10 @@ def cmd_compile() -> None:
             if not command_exists("wat2wasm"):
                 raise SystemExit("wat2wasm não encontrado; execute ./bin/plane setup ou instale WABT")
             sh(["wat2wasm", str(mod), "-o", str(out)])
+            try:
+                sh(["wat2wasm", str(mod), "-o", str(out)])
+            except FileNotFoundError:
+                raise SystemExit("wat2wasm não encontrado; instale WABT para compilar módulos .wat")
             wasm_paths.append(out)
         else:
             wasm_paths.append(mod)
@@ -209,6 +213,15 @@ def cmd_run(tick: float, skip_compile: bool, no_nats: bool, nats_port: int) -> N
     finally:
         if nats_proc is not None:
             nats_proc.terminate()
+    try:
+        sh(["wat2wasm", str(wat_file), "-o", str(DIST / "main.wasm")])
+    except FileNotFoundError:
+        raise SystemExit("wat2wasm não encontrado; instale WABT para gerar dist/main.wasm")
+    print("compilado: dist/main.wasm")
+
+
+def cmd_run(tick: float) -> None:
+    sh(["python3", str(ROOT / "runtime" / "supervisor.py"), "--tick", str(tick)])
 
 
 def main() -> None:
@@ -237,6 +250,12 @@ def main() -> None:
     if args.cmd == "setup":
         cmd_setup(args.check_only, args.skip_install, args.skip_compile)
     elif args.cmd == "fetch":
+    p_run = sub.add_parser("run")
+    p_run.add_argument("--tick", type=float, default=1.0)
+
+    args = parser.parse_args()
+
+    if args.cmd == "fetch":
         cmd_fetch(args.url_base)
     elif args.cmd == "validate":
         cmd_validate()
@@ -244,6 +263,7 @@ def main() -> None:
         cmd_compile()
     elif args.cmd == "run":
         cmd_run(args.tick, args.skip_compile, args.no_nats, args.nats_port)
+        cmd_run(args.tick)
 
 
 if __name__ == "__main__":

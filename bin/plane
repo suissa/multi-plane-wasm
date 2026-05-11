@@ -120,10 +120,6 @@ def cmd_compile() -> None:
             if not command_exists("wat2wasm"):
                 raise SystemExit("wat2wasm não encontrado; execute ./bin/plane setup ou instale WABT")
             sh(["wat2wasm", str(mod), "-o", str(out)])
-            try:
-                sh(["wat2wasm", str(mod), "-o", str(out)])
-            except FileNotFoundError:
-                raise SystemExit("wat2wasm não encontrado; instale WABT para compilar módulos .wat")
             wasm_paths.append(out)
         else:
             wasm_paths.append(mod)

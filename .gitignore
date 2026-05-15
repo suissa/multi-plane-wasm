@@ -1,0 +1,7 @@
+# Generated build artifacts
+dist/
+planes-modules/**/*.wasm
+
+# Python caches
+__pycache__/
+*.py[cod]
